@@ -22,34 +22,48 @@ class ColorMatcher:
         
         return (l_mean, l_std, a_mean, a_std, b_mean, b_std)
 
-    def find_best_reference(self, source_img, reference_images):
+   def find_best_reference(self, source_img, reference_images):
         """
-        Compara a imagem de entrada com todas as referências e escolhe a
-        que tem a Luminosidade (L) e Contraste (Std Dev) mais parecidos.
-        Isso evita aplicar uma referência de 'Dia' em uma foto de 'Noite'.
+        Versão APRIMORADA: Compara Brilho (L) e Cor (A, B) usando distância Euclidiana.
         """
+        # Desempacota estatísticas da imagem de origem
+        # src_stats contém: (l_mean, l_std, a_mean, a_std, b_mean, b_std)
         src_stats = self.get_image_stats(source_img)
-        src_l_mean = src_stats[0]
+        src_l, src_a, src_b = src_stats[0], src_stats[2], src_stats[4]
         
         best_ref = None
         min_diff = float('inf')
         
-        print(f"--- Analisando melhor match para a imagem... ---")
+        print(f"--- Analisando melhor match (Luminosidade + Cor)... ---")
         
         for ref_name, ref_img in reference_images.items():
             ref_stats = self.get_image_stats(ref_img)
-            ref_l_mean = ref_stats[0]
+            ref_l, ref_a, ref_b = ref_stats[0], ref_stats[2], ref_stats[4]
             
-            # Cálculo simples de distância baseado na luminosidade média
-            # Pode ser aprimorado para incluir desvio padrão (contraste)
-            diff = abs(src_l_mean - ref_l_mean)
+            # --- A MUDANÇA ESTÁ AQUI ---
             
-            if diff < min_diff:
-                min_diff = diff
+            # Calculamos a diferença em cada canal
+            diff_l = (src_l - ref_l) ** 2
+            diff_a = (src_a - ref_a) ** 2
+            diff_b = (src_b - ref_b) ** 2
+            
+            # Você pode dar pesos se quiser priorizar Brilho sobre Cor
+            # Ex: peso_luz = 2.0 (o brilho importa o dobro da cor)
+            peso_luz = 1.0
+            peso_cor = 1.0
+            
+            # Distância Euclidiana Ponderada
+            # Raiz quadrada da soma dos quadrados (Pitágoras em 3D)
+            total_diff = np.sqrt((diff_l * peso_luz) + (diff_a * peso_cor) + (diff_b * peso_cor))
+            
+            # ---------------------------
+            
+            if total_diff < min_diff:
+                min_diff = total_diff
                 best_ref = ref_img
                 best_ref_name = ref_name
         
-        print(f"Match escolhido: {best_ref_name} (Diferença de Luz: {min_diff:.2f})")
+        print(f"Match escolhido: {best_ref_name} (Distância: {min_diff:.2f})")
         return best_ref
 
     def apply_color_transfer(self, source, target, strength=1.0):
