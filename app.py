@@ -47,19 +47,19 @@ class ColorMatcher:
                 
         return best_ref, best_ref_name
 
-    def apply_smart_transfer(self, source, target):
+    def apply_smart_transfer(self, source, target, use_auto_contrast=True):
         """
-        Applies color correction and finalizes with a smart 'Auto-Contrast' 
-        step to prevent the 'washed-out' look (especially in cold tones).
+        Applies color correction. 
+        If use_auto_contrast is True, it performs dynamic range stretching.
         """
-        # Convert to LAB space (L=Lightness, A=Green/Red, B=Blue/Yellow)
+        # Convert to LAB space
         source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
         target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
 
         (l_src, a_src, b_src) = cv2.split(source_lab)
         (l_tar, a_tar, b_tar) = cv2.split(target_lab)
 
-        # Calculate Statistics (Mean & Standard Deviation)
+        # Calculate Statistics
         l_mean_src, l_std_src = l_src.mean(), l_src.std()
         a_mean_src, a_std_src = a_src.mean(), a_src.std()
         b_mean_src, b_std_src = b_src.mean(), b_src.std()
@@ -71,43 +71,37 @@ class ColorMatcher:
         eps = 1e-5
         
         # 1. Color (Chroma - A/B Channels): Aggressive match
-        # We want to force the brand colors onto the image
         a_new = ((a_src - a_mean_src) * (a_std_tar / (a_std_src + eps))) + a_mean_tar
         b_new = ((b_src - b_mean_src) * (b_std_tar / (b_std_src + eps))) + b_mean_tar
 
         # 2. Lightness (Luma - L Channel): Soft Transfer
-        # We blend the contrast (Std Dev) to avoid destroying the image structure.
         # 80% Original Contrast / 20% Reference Contrast
         contrast_blend = (l_std_src * 0.80) + (l_std_tar * 0.20)
         
-        # Apply Reinhard Transfer for Lightness
         l_new = ((l_src - l_mean_src) * (contrast_blend / (l_std_src + eps))) + l_mean_tar
 
-        # --- STEP 3: DYNAMIC RANGE RECOVERY (AUTO-LEVELS) ---
-        # Cold photos tend to look gray/flat after transfer. 
-        # This step stretches the histogram to ensure true blacks.
+        # --- STEP 3: DYNAMIC RANGE RECOVERY (OPTIONAL) ---
+        l_final = l_new
         
-        # Get the darkest (1%) and brightest (99%) pixel values
-        # We use 1% and 99% instead of 0/100 to ignore outliers/dead pixels
-        min_val = np.percentile(l_new, 1)
-        max_val = np.percentile(l_new, 99)
-        
-        # Min-Max Normalization (Stretching logic)
-        scale = 255.0 / (max_val - min_val + eps)
-        l_stretched = (l_new - min_val) * scale
-        
-        # Final Blend:
-        # We don't apply the stretch 100%, as it might look artificial.
-        # We mix 30% Stretched result with 70% Reinhard result.
-        l_final = (l_stretched * 0.3) + (l_new * 0.7)
+        if use_auto_contrast:
+            # Get the darkest (1%) and brightest (99%) pixel values
+            min_val = np.percentile(l_new, 1)
+            max_val = np.percentile(l_new, 99)
+            
+            # Min-Max Normalization (Stretching logic)
+            scale = 255.0 / (max_val - min_val + eps)
+            l_stretched = (l_new - min_val) * scale
+            
+            # Final Blend: 30% Stretched result with 70% Reinhard result.
+            l_final = (l_stretched * 0.3) + (l_new * 0.7)
         # ----------------------------------------------------
 
-        # Final Clipping to valid 0-255 range
+        # Final Clipping
         l_final = np.clip(l_final, 0, 255)
         a_new = np.clip(a_new, 0, 255)
         b_new = np.clip(b_new, 0, 255)
 
-        # Merge channels and convert back to BGR
+        # Merge and convert back
         transfer_lab = cv2.merge([l_final, a_new, b_new])
         transfer_bgr = cv2.cvtColor(transfer_lab.astype("uint8"), cv2.COLOR_LAB2BGR)
         
@@ -119,7 +113,6 @@ class ColorMatcher:
 class HumanDetector:
     def __init__(self):
         # 1. Face Detector (The Gatekeeper)
-        # model_selection=1 is for long-range images (full body/landscapes)
         self.mp_face = mp.solutions.face_detection
         self.face_detector = self.mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.6)
         
@@ -130,55 +123,43 @@ class HumanDetector:
     def has_face(self, image_rgb):
         """Checks if there is at least one visible face in the image."""
         results = self.face_detector.process(image_rgb)
-        # If results.detections is not None, a face was found.
         return results.detections is not None
 
     def get_mask(self, image):
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # --- NEW STEP: FACE CHECK ---
-        # If no face is detected, we skip segmentation entirely.
+        # Gatekeeper: No face? No mask.
         if not self.has_face(img_rgb):
-            # Return empty mask (Black) -> Treat as full background
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
-        # ----------------------------
 
-        # If a face exists, we proceed to segment the body
         results = self.segmenter.process(img_rgb)
         
         if results.segmentation_mask is None:
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
 
-        # Create writable copy of the mask
+        # Create writable copy
         mask = results.segmentation_mask.copy()
 
-        # 1. Hard Threshold: Clean noise
+        # Hard Threshold
         mask[mask < 0.5] = 0
         
-        # 2. Area Check: Ignore small blobs
+        # Area Check
         img_area = image.shape[0] * image.shape[1]
         person_area = np.count_nonzero(mask)
         
         if person_area < (img_area * 0.005): 
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
             
-        # 3. Edge Smoothing
+        # Smoothing
         mask = cv2.GaussianBlur(mask, (21, 21), 0)
         
         return mask
 
     def blend_human_safe(self, original, corrected_brand, mask):
-        """
-        Background: 100% Brand Look
-        Person (with face): 70% Original / 30% Brand Look
-        """
         person_look = cv2.addWeighted(original, 0.7, corrected_brand, 0.3, 0)
-        
         mask_3d = np.dstack((mask, mask, mask))
-        
         final = (person_look.astype(float) * mask_3d) + \
                 (corrected_brand.astype(float) * (1.0 - mask_3d))
-                
         return final.astype("uint8")
 
 # ==========================================
@@ -186,12 +167,11 @@ class HumanDetector:
 # ==========================================
 
 def load_local_references(folder_path="references"):
-    """Loads all images from the specified local folder."""
     images = {}
     valid_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG']
     
     if not os.path.exists(folder_path):
-        os.makedirs(folder_path) # Create if doesn't exist to avoid errors
+        os.makedirs(folder_path)
         return images
 
     for ext in valid_extensions:
@@ -200,9 +180,7 @@ def load_local_references(folder_path="references"):
             try:
                 img = Image.open(file_path)
                 img_array = np.array(img.convert('RGB'))
-                # Convert RGB (PIL) to BGR (OpenCV)
                 img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                # Resize for performance (stat calculation only)
                 img_cv = cv2.resize(img_cv, (300, 300))
                 
                 filename = os.path.basename(file_path)
@@ -219,24 +197,28 @@ def bgr_to_rgb(image):
 # 4. USER INTERFACE (STREAMLIT)
 # ==========================================
 
-st.set_page_config(page_title="Brand Color Corrector", layout="wide")
+st.set_page_config(page_title="Image Editor ABB", layout="wide")
 
-st.title("🎨 Automated Brand Color Corrector")
-st.markdown("Automatic color grading based on Brand Guidelines with AI Skin Tone Protection.")
+# --- UI HEADER UPDATED ---
+st.title("Image Editor ABB")
+st.subheader("Automated Brand Color Corrector")
+st.markdown("---")
 
 # --- SIDEBAR ---
 st.sidebar.header("Settings")
-use_ai = st.sidebar.checkbox("✅ AI Skin Protection", value=True, help="Detects humans to preserve natural skin tones.")
+
+# Toggles
+use_ai = st.sidebar.checkbox("✅ AI Skin Protection", value=True, help="Only active if a face is detected.")
+use_contrast = st.sidebar.checkbox("✅ Auto-Contrast Recovery", value=True, help="Stretches histogram to prevent 'washed out' look on cold images.")
 
 st.sidebar.divider()
 st.sidebar.subheader("Reference Library")
 
-# Load references automatically
+# Load references
 reference_images = load_local_references("references")
 
 if reference_images:
     st.sidebar.success(f"{len(reference_images)} Reference Images Loaded.")
-    # Optional: Show thumbnails in sidebar
     with st.sidebar.expander("View Active References"):
         for name, img in reference_images.items():
             st.image(bgr_to_rgb(img), caption=name, use_container_width=True)
@@ -248,7 +230,6 @@ else:
 target_file = st.file_uploader("Drop image here to process", type=['png', 'jpg', 'jpeg'])
 
 if target_file and reference_images:
-    # Load Input
     pil_image = Image.open(target_file)
     input_img = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
     
@@ -260,58 +241,50 @@ if target_file and reference_images:
         # 1. Find Best Reference
         best_ref, best_ref_name = color_engine.find_best_reference(input_img, reference_images)
         
-        # 2. Apply Base Correction (Aggressive)
-        corrected_base = color_engine.apply_smart_transfer(input_img, best_ref)
+        # 2. Apply Base Correction (With optional Auto-Contrast)
+        corrected_base = color_engine.apply_smart_transfer(input_img, best_ref, use_auto_contrast=use_contrast)
         
         final_img = corrected_base
         mask_visualization = None
         
-        # 3. AI Processing
+        # 3. AI Processing (If enabled AND face detected)
         if use_ai:
             mask = ai_engine.get_mask(input_img)
             
-            # Check if mask is not empty
             if np.max(mask) > 0.1:
                 final_img = ai_engine.blend_human_safe(input_img, corrected_base, mask)
-                
-                # Create Visualization: White Background, Black Person
-                # Mask is 1.0 for person, 0.0 for background.
-                # Inverted: 0.0 for person (Black), 1.0 for background (White)
                 mask_visualization = 1.0 - mask 
-                
             else:
-                st.toast("No humans detected. Full correction applied.", icon="ℹ️")
+                # No Toast needed for empty mask (silent fail is better for UX here)
+                pass
     
     # --- RESULTS DISPLAY ---
     st.success(f"Matched Guideline: **{best_ref_name}**")
     
-    # Dynamic columns: 2 or 3 depending on AI usage
     if mask_visualization is not None:
         c1, c2, c3 = st.columns(3)
     else:
         c1, c2 = st.columns(2)
         
     with c1:
-        st.subheader("Original")
+        st.caption("Original")
         st.image(bgr_to_rgb(input_img), use_container_width=True)
         
     if mask_visualization is not None:
         with c2:
-            st.subheader("AI Mask")
-            # Display grayscale mask. 
-            # Clamp allows showing 0-1 floats correctly in Streamlit
-            st.image(mask_visualization, caption="Black areas are protected", clamp=True, use_container_width=True)
+            st.caption("AI Protection Mask")
+            st.image(mask_visualization, clamp=True, use_container_width=True)
             
     with (c3 if mask_visualization is not None else c2):
-        st.subheader("Final Result")
+        st.caption("Final Result")
         st.image(bgr_to_rgb(final_img), use_container_width=True)
 
-    # Download Button
+    # Download
     result_pil = Image.fromarray(bgr_to_rgb(final_img))
     import io
     buf = io.BytesIO()
     result_pil.save(buf, format="JPEG", quality=95)
-    st.download_button("⬇️ Download Image", buf.getvalue(), f"brand_fixed_{target_file.name}", "image/jpeg")
+    st.download_button("⬇️ Download Image", buf.getvalue(), f"ABB_fixed_{target_file.name}", "image/jpeg")
 
 elif target_file and not reference_images:
     st.warning("⚠️ System halted. Please add images to the 'references' folder.")
