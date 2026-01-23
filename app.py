@@ -114,45 +114,64 @@ class ColorMatcher:
         return transfer_bgr
 
 # ==========================================
-# 2. AI ENGINE (Human Segmentation - Fixed)
+# 2. AI ENGINE (Face Detection + Segmentation)
 # ==========================================
 class HumanDetector:
     def __init__(self):
+        # 1. Face Detector (The Gatekeeper)
+        # model_selection=1 is for long-range images (full body/landscapes)
+        self.mp_face = mp.solutions.face_detection
+        self.face_detector = self.mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.6)
+        
+        # 2. Body Segmenter (The Masker)
         self.mp_selfie = mp.solutions.selfie_segmentation
         self.segmenter = self.mp_selfie.SelfieSegmentation(model_selection=1)
 
+    def has_face(self, image_rgb):
+        """Checks if there is at least one visible face in the image."""
+        results = self.face_detector.process(image_rgb)
+        # If results.detections is not None, a face was found.
+        return results.detections is not None
+
     def get_mask(self, image):
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # --- NEW STEP: FACE CHECK ---
+        # If no face is detected, we skip segmentation entirely.
+        if not self.has_face(img_rgb):
+            # Return empty mask (Black) -> Treat as full background
+            return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
+        # ----------------------------
+
+        # If a face exists, we proceed to segment the body
         results = self.segmenter.process(img_rgb)
         
-        # Se não achou nada, retorna preto
         if results.segmentation_mask is None:
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
 
-        # --- CORREÇÃO DO ERRO AQUI ---
-        # O MediaPipe entrega a máscara como "Read-Only". 
-        # Usamos .copy() para criar uma versão editável na memória.
+        # Create writable copy of the mask
         mask = results.segmentation_mask.copy()
-        # -----------------------------
 
-        # 1. Threshold Rígido: Limpa ruído (sombras fracas)
-        # Zera tudo que a IA não tem pelo menos 50% de certeza
+        # 1. Hard Threshold: Clean noise
         mask[mask < 0.5] = 0
         
-        # 2. Verificação de Área: Ignora "manchas" pequenas
+        # 2. Area Check: Ignore small blobs
         img_area = image.shape[0] * image.shape[1]
         person_area = np.count_nonzero(mask)
         
-        # Se a pessoa ocupa menos de 0.5% da foto, consideramos erro
         if person_area < (img_area * 0.005): 
             return np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
             
-        # 3. Suavização das bordas
+        # 3. Edge Smoothing
         mask = cv2.GaussianBlur(mask, (21, 21), 0)
         
         return mask
 
     def blend_human_safe(self, original, corrected_brand, mask):
+        """
+        Background: 100% Brand Look
+        Person (with face): 70% Original / 30% Brand Look
+        """
         person_look = cv2.addWeighted(original, 0.7, corrected_brand, 0.3, 0)
         
         mask_3d = np.dstack((mask, mask, mask))
