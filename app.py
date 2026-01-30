@@ -221,7 +221,7 @@ if reference_images:
     st.sidebar.success(f"{len(reference_images)} Reference Images Loaded.")
     with st.sidebar.expander("View Active References"):
         for name, img in reference_images.items():
-            st.image(bgr_to_rgb(img), caption=name, use_container_width=True)
+            st.image(bgr_to_rgb(img), caption=name, width='stretch')
 else:
     st.sidebar.error("No references found!")
     st.sidebar.info("Please create a folder named 'references' and add your brand JPG/PNG files there.")
@@ -240,7 +240,12 @@ if target_file and reference_images:
     
     # Init Engines
     color_engine = ColorMatcher()
-    ai_engine = HumanDetector() if use_ai else None
+    try:
+        ai_engine = HumanDetector() if use_ai else None
+    except (AttributeError, Exception) as e:
+        ai_engine = None
+        if use_ai:
+            st.sidebar.warning("AI face protection unavailable (MediaPipe issue). Color correction only.")
     
     with st.spinner('Processing...'):
         # 1. Find Best Reference
@@ -273,16 +278,16 @@ if target_file and reference_images:
         
     with c1:
         st.caption("Original")
-        st.image(bgr_to_rgb(input_img), use_container_width=True)
+        st.image(bgr_to_rgb(input_img), width='stretch')
         
     if mask_visualization is not None:
         with c2:
             st.caption("AI Protection Mask")
-            st.image(mask_visualization, clamp=True, use_container_width=True)
+            st.image(mask_visualization, clamp=True, width='stretch')
             
     with (c3 if mask_visualization is not None else c2):
         st.caption("Final Result")
-        st.image(bgr_to_rgb(final_img), use_container_width=True)
+        st.image(bgr_to_rgb(final_img), width='stretch')
 
     # Download
     result_pil = Image.fromarray(bgr_to_rgb(final_img))
